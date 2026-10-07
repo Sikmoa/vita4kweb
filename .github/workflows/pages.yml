@@ -44,6 +44,16 @@ jobs:
 
       - name: Build
         run: nix develop --command bash browser/pages/build.sh
+        env:
+          EM_CACHE: ${{ github.workspace }}/.cache/emscripten
+
+      # Enables SharedArrayBuffer & Wasm64 cross-origin isolation on GitHub Pages
+      - name: Inject COOP/COEP Service Worker
+        run: |
+          curl -sSL https://raw.githubusercontent.com/gzguidotti/coi-serviceworker/main/coi-serviceworker.min.js -o build/pages/coi-serviceworker.js
+          if [ -f build/pages/index.html ]; then
+            grep -q "coi-serviceworker.js" build/pages/index.html || sed -i 's|<head>|<head><script src="coi-serviceworker.js"></script>|g' build/pages/index.html
+          fi
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3

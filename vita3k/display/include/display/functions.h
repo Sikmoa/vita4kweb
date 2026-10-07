@@ -1,0 +1,46 @@
+// Vita3K emulator project
+// Copyright (C) 2026 Vita3K team
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+#pragma once
+
+#include <kernel/thread/thread_state.h>
+
+#include <cstdint>
+
+struct DisplayState;
+struct KernelState;
+struct EmuEnvState;
+struct DisplayFrameInfo;
+
+void start_sync_thread(EmuEnvState &emuenv);
+// One emulated vblank tick: increments the vblank count, notifies the vblank
+// callbacks and wakes the threads whose target vcount was reached. Runs on the
+// native host vblank thread; single-threaded hosts (browser Worker) drive it
+// cooperatively from wait_vblank instead.
+void advance_vblank(EmuEnvState &emuenv);
+// Advance the emulated vblank clock on hosts that have no vblank thread of
+// their own (the browser Worker). Returns true when this call may have woken a
+// waiter or a vblank callback, so a cooperative scheduler can count it as
+// forward progress instead of idling. In wall-clock mode the clock follows
+// real time whether or not a thread waits (guests also poll the vcount); in
+// fast-vblank mode it moves only while a thread is registered in
+// display.vblank_wait_infos.
+bool service_vblank(EmuEnvState &emuenv);
+void wait_vblank(EmuEnvState &emuenv, const ThreadStatePtr &wait_thread, const uint64_t target_vcount, const bool is_cb);
+// if the result is not nullptr, contain the predicted frame (pointer needs to be freed later)
+DisplayFrameInfo *predict_next_image(EmuEnvState &emuenv, Address sync_object);
+void update_prediction(EmuEnvState &emuenv, DisplayFrameInfo &frame);

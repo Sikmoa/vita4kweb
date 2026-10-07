@@ -1,0 +1,141 @@
+// Vita3K emulator project
+// Copyright (C) 2026 Vita3K team
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+#pragma once
+
+#include <mem/atomic.h>
+#include <mem/functions.h>
+#include <mem/state.h>
+
+#include <type_traits>
+
+template <class T>
+class Ptr {
+public:
+    Ptr() = default;
+
+    explicit Ptr(Address address)
+        : addr(address) {
+    }
+
+    template <class U>
+    Ptr(const Ptr<U> &other)
+        : addr(other.address()) {
+        static_assert(std::is_convertible_v<U *, T *>, "Ptr is not convertible.");
+    }
+
+    Ptr(T *pointer, const MemState &mem) {
+        if constexpr (std::is_function_v<T>) {
+            // A function-typed pointer returned by Ptr::get is a guest byte
+            // location, not a callable host function/table slot. Reverse-map
+            // it just like a data pointer; real host functions are rejected.
+            mem_host_to_guest(mem, reinterpret_cast<const void *>(pointer), addr);
+        } else {
+            mem_host_to_guest(mem, pointer, addr);
+        }
+    }
+
+    Address address() const {
+        return addr;
+    }
+
+    template <class U>
+    Ptr<U> cast() const {
+        return Ptr<U>(addr);
+    }
+
+    // Unchecked HLE/native fast path, NOT an interpreter access check. In Wasm,
+    // wasm32 bulk spans are contiguous only within one allocation/mapping.
+    // Memory64 bytes are direct, but validity/permissions remain guest metadata.
+    T *get(const MemState &mem) const {
+        return addr ? reinterpret_cast<T *>(mem_guest_to_host(mem, addr)) : nullptr;
+    }
+
+    template <class U>
+    bool atomic_compare_and_swap(MemState &mem, U value, U expected) {
+        static_assert(std::is_arithmetic_v<U>);
+        static_assert(std::is_same_v<U, T>);
+        const auto ptr = get(mem);
+        if (!ptr)
+            return false;
+        return ::atomic_compare_and_swap(ptr, value, expected);
+    }
+
+    bool valid(const MemState &mem) const {
+        return is_valid_addr(mem, addr);
+    }
+
+    void reset() {
+        addr = 0;
+    }
+
+    explicit operator bool() const {
+        return addr != 0;
+    }
+
+    Ptr &operator=(const Address &address) {
+        addr = address;
+        return *this;
+    }
+
+    Ptr &operator=(std::nullptr_t) {
+        addr = 0;
+        return *this;
+    }
+
+private:
+    Address addr{};
+};
+
+static_assert(sizeof(Ptr<const void>) == 4, "Size of Ptr isn't 4 bytes.");
+static_assert(sizeof(Ptr<void()>) == 4, "Vita function pointers must remain 32 bits.");
+
+template <class T>
+Ptr<T> operator+(const Ptr<T> &base, int32_t offset) {
+    // ARM pointer arithmetic wraps in 32 bits regardless of host size_t width.
+    return Ptr<T>(base.address() + static_cast<uint32_t>(offset) * static_cast<uint32_t>(sizeof(T)));
+}
+
+template <class T, class U>
+bool operator<(const Ptr<T> &a, const Ptr<U> &b) {
+    return a.address() < b.address();
+}
+
+template <class T>
+bool operator==(const Ptr<T> &a, const Ptr<T> &b) {
+    return a.address() == b.address();
+}
+
+template <class T>
+Ptr<T> alloc(MemState &mem, const char *name) {
+    const Address address = alloc(mem, sizeof(T), name);
+    const Ptr<T> ptr(address);
+    if (!ptr) {
+        return ptr;
+    }
+
+    T *const memory = ptr.get(mem);
+    new (memory) T;
+
+    return ptr;
+}
+
+template <class T>
+void free(MemState &mem, const Ptr<T> &ptr) {
+    ptr.get(mem)->~T();
+    free(mem, ptr.address());
+}

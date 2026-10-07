@@ -1,0 +1,213 @@
+// SceAppMgr, SceRtc and sysmodule kernel imports against firmware 3.74
+// (expected values from the firmware code run in an emulator, see the
+// commit message).
+#pragma once
+#include <io/functions.h>
+#include <modules/module_parent.h>
+#include <rtc/rtc.h>
+#include <cstring>
+#include <string>
+
+inline void test_guest_appmgr_rtc(EmuEnvState &env, ThreadState &thread) {
+    auto &cpu = *thread.cpu;
+    const auto call = [&](uint32_t nid, std::initializer_list<uint32_t> args) {
+        uint32_t reg = 0;
+        for (const uint32_t value : args)
+            write_reg(cpu, reg++, value);
+        call_import(env, cpu, nid, thread.id);
+        REQUIRE(env.missing_nids.empty());
+        return read_reg(cpu, 0);
+    };
+    constexpr uint32_t receive_event = 0x10B5765F, is_game = 0xFFF8F7F0, convert_vs0 = 0xADAA658E,
+                       data_drive = 0xC0631748, module_drive = 0x906154DE, parse_date_time = 0x2347CE12,
+                       parse_rfc3339 = 0x2D18AEEC, format_rfc3339 = 0xCCEA2B54, check_valid = 0xD7622935,
+                       get_thread_id = 0x59D06540, memcpy_to_user = 0x6D88EF8A,
+                       acmgr_is_game = 0x1298C647, acmgr_psm = 0xC98D82EE, acmgr_dev = 0xE87D1777,
+                       processmgr_dipsw = 0x61B9B6FA;
+    const Address block = alloc(env.mem, 0x800, "appmgr fixture");
+    REQUIRE(block);
+    auto *bytes = Ptr<uint8_t>(block).get(env.mem);
+    const auto put = [&](Address at, const char *value) { std::strcpy(Ptr<char>(at).get(env.mem), value); return at; };
+    const auto text = [&](Address at) { return std::string(Ptr<const char>(at).get(env.mem)); };
+
+    // No system event: 64 zero bytes and 0x80802013; NULL is 0x80802016.
+    std::memset(bytes, 0xcc, 0x40);
+    REQUIRE(call(receive_event, { block }) == 0x80802013);
+    for (int i = 0; i < 0x40; ++i)
+        REQUIRE(bytes[i] == 0);
+    REQUIRE(call(receive_event, { 0 }) == 0x80802016);
+
+    // App state: nothing pending; the checks come before the pointer's, and
+    // the 128 bytes are zeroed whatever the result.
+    constexpr uint32_t app_state = 0x5E86319A;
+    std::memset(bytes, 0xcc, 0x80);
+    REQUIRE(call(app_state, { block, 0x80, 0x02000000 }) == 0);
+    for (int i = 0; i < 0x80; ++i)
+        REQUIRE(bytes[i] == 0);
+    std::memset(bytes, 0xcc, 0x80);
+    REQUIRE(call(app_state, { block, 0x7c, 0x02000000 }) == 0x8080201A && bytes[0x7f] == 0);
+    REQUIRE(call(app_state, { block, 0x80, 0x03740012 }) == 0x8080201A);
+    REQUIRE(call(app_state, { 0, 0x80, 0x02000000 }) == 0x80802016);
+    REQUIRE(call(app_state, { 0, 0x40, 0x02000000 }) == 0x8080201A);
+
+    // A game has PAID class 0x210 (Limbo: 0x210000101CCA010C).
+    const uint64_t saved_paid = env.kernel.process_program_authority_id;
+    env.kernel.process_program_authority_id = 0x210000101CCA010CULL;
+    REQUIRE(call(is_game, {}) == 1 && call(acmgr_is_game, { 0 }) == 1 && call(acmgr_psm, { 0 }) == 0);
+    env.kernel.process_program_authority_id = 0x2800000000000001ULL;
+    REQUIRE(call(is_game, {}) == 0);
+    env.kernel.process_program_authority_id = 0x210000101CD20009ULL; // PSM Developer Assistant range
+    REQUIRE(call(acmgr_psm, { 0 }) == 1);
+    env.kernel.process_program_authority_id = saved_paid;
+    REQUIRE(call(acmgr_dev, {}) == 0 && call(processmgr_dipsw, { 0, 17 }) == 0x80029008);
+
+    // vs0 user drives: sd + 12 hex digits + ':', resolved by the IO layer.
+    init_device_paths(env.io);
+    REQUIRE(call(data_drive, { block + 0x100 }) == 0);
+    const std::string drive = text(block + 0x100);
+    REQUIRE(drive.size() == 15 && drive.rfind("sd", 0) == 0 && drive.back() == ':' && drive == env.io.vs0_data_drive);
+    REQUIRE(call(module_drive, { block + 0x100 }) == 0 && text(block + 0x100) == env.io.vs0_module_drive);
+    const Address path = block + 0x200, out = block + 0x400;
+    put(path, "vs0:/data/external/cert/CA_LIST.cer");
+    REQUIRE(call(convert_vs0, { path, out, 64 }) == 0 && text(out) == drive + "/cert/CA_LIST.cer");
+    REQUIRE(resolve_user_mount(env.io, text(out).c_str()) == "vs0:data/external/cert/CA_LIST.cer");
+    put(path, "vs0:sys/external/libhttp.suprx");
+    REQUIRE(call(convert_vs0, { path, out, 64 }) == 0 && text(out) == env.io.vs0_module_drive + "/libhttp.suprx");
+    // The module loader takes the drive's name for the same module.
+    const SceUID by_drive = load_module(env, env.io.vs0_module_drive + "/libfixture.suprx");
+    REQUIRE(by_drive >= 0 && load_module(env, "vs0:sys/external/libfixture.suprx") == by_drive);
+    REQUIRE(std::string(env.kernel.loaded_modules.at(by_drive)->info.path) == "vs0:sys/external/libfixture.suprx");
+    env.kernel.loaded_modules.erase(by_drive);
+    put(path, "ux0:data/file.txt"); // not a vs0 user path: copied
+    REQUIRE(call(convert_vs0, { path, out, 64 }) == 0 && text(out) == "ux0:data/file.txt");
+    REQUIRE(call(convert_vs0, { path, out, 32 }) == 0x80800001 && Ptr<uint8_t>(out).get(env.mem)[0] == 0);
+    REQUIRE(call(convert_vs0, { path, 0, 64 }) == 0x80800001);
+
+    // RTC: RFC 3339 formatting and RFC 1123 / RFC 3339 parsing.
+    const auto tick_of = [](const char *rfc3339) {
+        uint64_t tick = 0;
+        REQUIRE(rtc_parse_rfc3339(&tick, rfc3339) == 0);
+        return tick;
+    };
+    auto *tick = Ptr<uint64_t>(block + 0x600).get(env.mem);
+    *tick = tick_of("2024-03-05T07:08:09.123456Z");
+    REQUIRE(call(format_rfc3339, { out, block + 0x600, 540 }) == 0 && text(out) == "2024-03-05T16:08:09.12+09:00");
+    REQUIRE(call(format_rfc3339, { out, block + 0x600, 0 }) == 0 && text(out) == "2024-03-05T07:08:09.12Z");
+    REQUIRE(call(format_rfc3339, { out, block + 0x600, 1440 }) == 0x80251000);
+    put(path, "Tue, 05 Mar 2024 07:08:09 +0900");
+    REQUIRE(call(parse_date_time, { block + 0x600, path }) == 0 && *tick == tick_of("2024-03-04T22:08:09Z"));
+    put(path, "Tue Mar  5 07:08:09 2024");
+    REQUIRE(call(parse_date_time, { block + 0x600, path }) == 0 && *tick == tick_of("2024-03-05T07:08:09Z"));
+    put(path, "05 Mar 2024 07:08:09 GMT"); // the weekday is required
+    *tick = 7;
+    REQUIRE(call(parse_date_time, { block + 0x600, path }) == 0x80251080 && *tick == 7);
+    put(path, "2024-03-05T07:08:60Z"); // second 60 rolls over
+    REQUIRE(call(parse_rfc3339, { block + 0x600, path }) == 0 && *tick == tick_of("2024-03-05T07:09:00Z"));
+    put(path, "2024-02-30T07:08:09Z");
+    REQUIRE(call(parse_rfc3339, { block + 0x600, path }) == 0x80251083);
+    auto *date = Ptr<uint16_t>(block + 0x700).get(env.mem);
+    const uint16_t valid[6] = { 2024, 3, 5, 7, 8, 9 };
+    std::memcpy(date, valid, sizeof(valid));
+    *Ptr<uint32_t>(block + 0x70C).get(env.mem) = 999999;
+    REQUIRE(call(check_valid, { block + 0x700 }) == 0);
+    date[0] = 0;
+    REQUIRE(call(check_valid, { block + 0x700 }) == 0x80251081);
+
+    // Kernel imports of sysmodule.
+    REQUIRE(call(get_thread_id, {}) == static_cast<uint32_t>(thread.id));
+    std::memset(bytes + 0x780, 0, 4);
+    *Ptr<uint32_t>(block + 0x790).get(env.mem) = 0x12345678;
+    REQUIRE(call(memcpy_to_user, { block + 0x780, block + 0x790, 4 }) == 0 && *Ptr<uint32_t>(block + 0x780).get(env.mem) == 0x12345678);
+    // System software version and the system clock's low word.
+    constexpr uint32_t sw_version = 0x5182E212, time_low = 0x47F6DE49;
+    auto *version = Ptr<uint32_t>(block + 0x700).get(env.mem);
+    std::memset(version, 0xcc, 0x28);
+    version[0] = 0x24;
+    REQUIRE(call(sw_version, { block + 0x700 }) == 0x80020005);
+    version[0] = 0x28;
+    REQUIRE(call(sw_version, { block + 0x700 }) == 0);
+    REQUIRE(version[0] == 0x28 && text(block + 0x704) == "3.74" && version[8] == 0x03740011 && version[9] == 0);
+    REQUIRE(call(sw_version, { 0 }) == 0x80022005);
+    const uint32_t first_low = call(time_low, {});
+    REQUIRE(call(time_low, {}) - first_low < 10000000u); // microseconds, monotonic within the test
+    // Processmgr for sysmodule: the executable's SDK version (Limbo:
+    // 0x02000081) and the PMUSERENR word libkernel reads back.
+    constexpr uint32_t sdk_version = 0xD141C076, set_pmuserenr = 0x6599E5D9, get_pmuserenr = 0xF8A99FDF;
+    env.kernel.process_sdk_version = 0x02000081;
+    REQUIRE(call(sdk_version, { 0, block + 0x5f0 }) == 0 && *Ptr<uint32_t>(block + 0x5f0).get(env.mem) == 0x02000081);
+    REQUIRE(call(sdk_version, { 7, block + 0x5f0 }) == 0x80029001);
+    env.kernel.process_sdk_version = 0;
+    REQUIRE(call(set_pmuserenr, { 0, 1 }) == 0 && call(get_pmuserenr, {}) == 1);
+    REQUIRE(call(set_pmuserenr, { 0, 0 }) == 0 && call(get_pmuserenr, {}) == 0);
+    REQUIRE(call(set_pmuserenr, { 7, 1 }) == 0x80029001);
+
+    // Abort handler: a non-zero argument is refused; a program that is not a
+    // game returns (a game's thread would never return).
+    constexpr uint32_t abort_handler = 0xEB6E50BB, sync_by_fd = 0x16512F59;
+    REQUIRE(call(abort_handler, { 0x102, 1 }) == 0x80020005);
+    REQUIRE(!env.kernel.process_is_game_program() && call(abort_handler, { 0x102, 0 }) == 0);
+    REQUIRE(call(sync_by_fd, { 0x7fff1234, 0 }) == 0x80010009);
+
+    // Thread event handlers: one UID per registration; libc's exit handler
+    // covers every user thread (0x10027) with END.
+    constexpr uint32_t register_handler = 0x6D8C0F13, unregister_handler = 0x2C8ED6F0;
+    const Address handler_name = put(block + 0x600, "fixture handler");
+    const Address saved_sp = read_sp(cpu);
+    write_sp(cpu, block + 0x7f0);
+    auto *stack = Ptr<uint32_t>(block + 0x7f0).get(env.mem);
+    stack[0] = 0; // common
+    const uint32_t handler_address = block + 0x401;
+    const uint32_t all_threads = call(register_handler, { handler_name, 0x10027, 8, handler_address });
+    const uint32_t own_thread = call(register_handler, { handler_name, 0, 8, handler_address });
+    REQUIRE(static_cast<int32_t>(all_threads) > 0 && static_cast<int32_t>(own_thread) > 0 && all_threads != own_thread);
+    REQUIRE(env.kernel.thread_event_handlers_for(thread.id, 8).size() == 2);
+    REQUIRE(env.kernel.thread_event_handlers_for(thread.id, 4).empty());
+    REQUIRE(call(register_handler, { handler_name, 0, 4, handler_address }) == 0x80020005); // own thread: END only
+    REQUIRE(call(register_handler, { handler_name, 0x10027, 0x10, handler_address }) == 0x80020005);
+    REQUIRE(call(register_handler, { handler_name, 0x7fff0001, 8, handler_address }) == 0x80028021);
+    REQUIRE(call(register_handler, { 0, 0x10027, 8, handler_address }) == 0x80020006);
+    REQUIRE(call(unregister_handler, { all_threads }) == 0 && call(unregister_handler, { all_threads }) == 0x80028061);
+    REQUIRE(call(unregister_handler, { own_thread }) == 0);
+    REQUIRE(env.kernel.thread_event_handlers_for(thread.id, 8).empty());
+    write_sp(cpu, saved_sp);
+
+    // Module classes: loaded by the app, or a system load (preload,
+    // sysmodule); kernel modules are not in the process.
+    constexpr uint32_t module_list = 0x2EF2581F, called_from_sys = 0x85E6D2BB, call_module_exit = 0x15E2A45D;
+    const auto add_module = [&](const char *path, bool system_loaded, Address segment) {
+        auto module = std::make_shared<KernelModule>();
+        std::strcpy(module->info.path, path);
+        module->info.size = sizeof(module->info);
+        module->info.segments[0].vaddr = Ptr<const void>(segment);
+        module->info.segments[0].memsz = 0x80;
+        module->system_loaded = system_loaded;
+        const SceUID uid = env.kernel.get_next_uid();
+        module->info.modid = uid;
+        env.kernel.loaded_modules[uid] = module;
+        return uid;
+    };
+    auto saved_modules = env.kernel.loaded_modules;
+    env.kernel.loaded_modules.clear();
+    const SceUID app_module = add_module("app0:sce_module/game.suprx", false, block + 0x100);
+    const SceUID system_module = add_module("vs0:sys/external/libhttp.suprx", true, block + 0x180);
+    add_module("os0:kd/sysmodule.skprx", true, block + 0x200);
+    auto *ids = Ptr<uint32_t>(block + 0x300).get(env.mem);
+    auto *count = Ptr<uint32_t>(block + 0x340).get(env.mem);
+    *count = 8;
+    REQUIRE(call(module_list, { 0, block + 0x300, block + 0x340 }) == 0 && *count == 1 && ids[0] == static_cast<uint32_t>(app_module));
+    *count = 8;
+    REQUIRE(call(module_list, { 0x80, block + 0x300, block + 0x340 }) == 0 && *count == 1 && ids[0] == static_cast<uint32_t>(system_module));
+    *count = 1;
+    REQUIRE(call(module_list, { 0x81, block + 0x300, block + 0x340 }) == 0 && *count == 1); // stops at the capacity
+    REQUIRE(call(module_list, { 0x81, 0, 0 }) == 2);
+    REQUIRE(call(called_from_sys, { block + 0x1c0 }) == 1 && call(called_from_sys, { block + 0x100 }) == 0);
+    REQUIRE(call(called_from_sys, { block + 0x200 }) == 0 && call(called_from_sys, { block + 0x7f0 }) == 0);
+    // Class 1 holds no started module with a module_exit: nothing runs.
+    env.kernel.loaded_modules[system_module]->info.exit_entry = Ptr<const void>(block + 0x181);
+    env.kernel.loaded_modules[system_module]->started = true;
+    REQUIRE(call(call_module_exit, { 1 }) == 0);
+    env.kernel.loaded_modules = std::move(saved_modules);
+
+    free(env.mem, block);
+    std::puts("Guest AppMgr/RTC: system events, game program, vs0 drives, RFC 3339/1123 and sysmodule kernel imports passed");
+}

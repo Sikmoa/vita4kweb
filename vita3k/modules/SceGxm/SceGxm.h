@@ -1,0 +1,37 @@
+// Vita3K emulator project
+// Copyright (C) 2026 Vita3K team
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+#pragma once
+
+#include <module/module.h>
+
+struct SceGxmInitializeParams;
+struct SceGxmRenderTargetParams;
+struct SceGxmRenderTarget;
+
+DECL_EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params);
+DECL_EXPORT(int, sceGxmRenderingContextIsWithinSceneInternal);
+
+// False before sceGxmInitialize; else whether the immediate context is
+// between sceGxmBeginScene and sceGxmEndScene.
+bool gxm_immediate_context_within_scene(EmuEnvState &emuenv);
+// libgxm 3.74 USSE map and unmap argument checks, shared by the public and
+// internal entry points.
+int gxm_check_usse_mapping(EmuEnvState &emuenv, const char *export_name, Ptr<void> base, uint32_t size, const uint32_t *offset);
+int gxm_check_usse_unmapping(EmuEnvState &emuenv, const char *export_name, const void *base);
+DECL_EXPORT(int, sceGxmCreateRenderTarget, const SceGxmRenderTargetParams *params, Ptr<SceGxmRenderTarget> *renderTarget);
+DECL_EXPORT(int, sceGxmGetRenderTargetMemSize, const SceGxmRenderTargetParams *params, uint32_t *hostMemSize);

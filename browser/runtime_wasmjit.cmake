@@ -1,0 +1,137 @@
+# M14 is opt-in and does not replace the working display application's CPU.
+include(${CMAKE_CURRENT_LIST_DIR}/runtime_dynarmic_frontend.cmake)
+add_library(vita3k_wasm_jit STATIC
+    "${VITA_ROOT}/cpu/src/wasm_jit_cpu.cpp"
+    "${VITA_ROOT}/cpu/src/wasmjit/emit_wasm.cpp"
+    "${VITA_ROOT}/cpu/src/wasmjit/fp64.cpp"
+)
+target_link_libraries(vita3k_wasm_jit PUBLIC vita3k_dynarmic_frontend vita3k_web_runtime_core)
+# fp64.cpp calls the vendored Dynarmic FP routines, which throw only from
+# mcl's compile-time ASSERT branch. Ignoring exceptions drops their landing
+# pads: under Emscripten's JS exception handling each call would otherwise go
+# through an invoke_* JS wrapper on every guest FP helper call.
+set_source_files_properties("${VITA_ROOT}/cpu/src/wasmjit/fp64.cpp" PROPERTIES COMPILE_OPTIONS "-fignore-exceptions")
+target_include_directories(vita3k_wasm_jit PRIVATE "${VITA_ROOT}/cpu/src")
+target_link_options(vita3k_wasm_jit INTERFACE
+    ${VITA3K_WEB_GROWTH_LINK_OPTION} -sALLOW_TABLE_GROWTH=1 -Wl,--export-table
+    -sSTACK_SIZE=1048576 "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=['$setWasmTableEntry','$getWasmTableEntry']"
+)
+
+# Opt-in lifecycle host for parent-owned app/tests. Keep this separate from the
+# CPU library so JIT-only probes need not pull in HLE or Asyncify fibers.
+# Single-threaded builds only: the threaded build (THREADS.md) runs guest
+# threads on host threads through the desktop kernel paths instead.
+if(NOT VITA3K_WEB_THREADS)
+    add_library(vita3k_guest_thread_runtime STATIC
+        src/guest_fiber_scheduler.cpp
+        src/guest_thread_runtime.cpp)
+    target_include_directories(vita3k_guest_thread_runtime PUBLIC "${CMAKE_CURRENT_LIST_DIR}/src")
+    target_link_libraries(vita3k_guest_thread_runtime PUBLIC vita3k_web_runtime_hle vita3k_wasm_jit)
+    target_compile_options(vita3k_guest_thread_runtime PUBLIC -fexceptions)
+    target_link_options(vita3k_guest_thread_runtime INTERFACE -fexceptions -sASYNCIFY=1
+        -lexports.js "SHELL:--post-js ${CMAKE_CURRENT_LIST_DIR}/src/asyncify_post.js")
+    set_property(TARGET vita3k_guest_thread_runtime PROPERTY INTERFACE_LINK_DEPENDS
+        "${CMAKE_CURRENT_LIST_DIR}/src/asyncify_post.js")
+endif()
+
+# Separate fixture-launch targets: opting into tests does not switch the
+# already-working interpreter application. The Worker selects this module only
+# when created with ?backend=jit.
+if(VITA3K_WEB_THREADS)
+    set(VITA3K_WEB_JIT_TARGET vita3k_web_jit_mt)
+else()
+    set(VITA3K_WEB_JIT_TARGET vita3k_web_jit)
+endif()
+add_executable(${VITA3K_WEB_JIT_TARGET}
+    src/main.cpp src/vita_runtime.cpp src/vita_display_bridge.cpp
+    src/memory.cpp src/interpreter.cpp src/guest.cpp
+    src/vita_aot.cpp src/vita_app.cpp)
+target_compile_definitions(${VITA3K_WEB_JIT_TARGET} PRIVATE VITA3K_WEB=1 VITA3K_USE_WASM_JIT=1)
+target_link_libraries(${VITA3K_WEB_JIT_TARGET} PRIVATE vita3k_web_runtime_hle vita3k_wasm_jit)
+if(TARGET vita3k_guest_thread_runtime)
+    target_link_libraries(${VITA3K_WEB_JIT_TARGET} PRIVATE vita3k_guest_thread_runtime)
+endif()
+# The retail-app entry points are exported for the Worker, and the FS runtime is
+# exported so staged content can be uploaded into MEMFS before vita3k_web_run_app
+# (the browser build has no NODERAWFS). FORCE_FILESYSTEM keeps the FS library in
+# the link even when only the harness (not the guest) touches it.
+target_link_options(${VITA3K_WEB_JIT_TARGET} PRIVATE
+    -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=Vita3KWebJit
+    -sENVIRONMENT=web,worker -sNO_EXIT_RUNTIME=1 $<$<NOT:$<BOOL:${VITA3K_WEB_THREADS}>>:-sASYNCIFY=1>
+    -sFORCE_FILESYSTEM=1
+    ${VITA3K_WEB_INITIAL_MEMORY_LINK_OPTION}
+    "-sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_vita3k_web_set_app_paths','_vita3k_web_set_license_key','_vita3k_web_run_app']"
+    "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','cwrap','HEAPU8']")
+
+if(VITA3K_WEB_THREADS)
+    target_link_options(${VITA3K_WEB_JIT_TARGET} PRIVATE -sPTHREAD_POOL_SIZE=24
+        "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=['$PThread','$setWasmTableEntry','$getWasmTableEntry']")
+endif()
+
+# The guest hot path must not call through invoke_* exception wrappers. The
+# symbol map names functions for the check without shipping a name section.
+target_link_options(${VITA3K_WEB_JIT_TARGET} PRIVATE --emit-symbol-map)
+# The threaded build has no fiber scheduler, so the functions checked do not exist there.
+if(NOT VITA3K_WEB_THREADS)
+find_program(VITA3K_WASM_OBJDUMP wasm-objdump REQUIRED)
+add_custom_command(TARGET ${VITA3K_WEB_JIT_TARGET} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E env "WASM_OBJDUMP=${VITA3K_WASM_OBJDUMP}"
+        ${CMAKE_CROSSCOMPILING_EMULATOR} "${CMAKE_CURRENT_LIST_DIR}/tests/hot_path_invokes.mjs"
+        "$<TARGET_FILE_DIR:${VITA3K_WEB_JIT_TARGET}>/${VITA3K_WEB_JIT_TARGET}.wasm"
+    VERBATIM)
+endif()
+
+add_executable(vita3k_jit_fixture_node
+    src/vita_runtime.cpp src/vita_display_bridge.cpp src/vita_aot.cpp tests/vita_bench_main.cpp)
+target_compile_definitions(vita3k_jit_fixture_node PRIVATE VITA3K_USE_WASM_JIT=1)
+target_link_libraries(vita3k_jit_fixture_node PRIVATE vita3k_web_runtime_hle vita3k_wasm_jit)
+target_link_options(vita3k_jit_fixture_node PRIVATE -sNODERAWFS=1)
+
+add_executable(vita3k_jit_bench tests/jit_bench.cpp)
+target_link_libraries(vita3k_jit_bench PRIVATE vita3k_wasm_jit)
+
+add_executable(vita3k_jit_tests_node tests/wasm_jit_tests.cpp)
+target_link_libraries(vita3k_jit_tests_node PRIVATE vita3k_wasm_jit)
+
+add_executable(vita3k_jit_tests tests/wasm_jit_tests.cpp)
+target_compile_definitions(vita3k_jit_tests PRIVATE VITA3K_JIT_TEST_NO_MAIN=1)
+target_link_libraries(vita3k_jit_tests PRIVATE vita3k_wasm_jit)
+target_link_options(vita3k_jit_tests PRIVATE
+    --no-entry -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=Vita3KJitTests
+    -sENVIRONMENT=web,worker "-sEXPORTED_FUNCTIONS=['_vita3k_web_jit_tests']"
+)
+
+# Backend integration test: this TU includes wasm_jit_cpu.cpp directly to
+# exercise its anonymous-namespace checked-memory helpers, so it links the
+# frontend/core but NOT the vita3k_wasm_jit library (no duplicate symbols).
+add_executable(vita3k_jit_backend_test_node "${VITA_ROOT}/cpu/tests/wasmjit_backend_test.cpp"
+    "${VITA_ROOT}/cpu/src/wasmjit/emit_wasm.cpp"
+    "${VITA_ROOT}/cpu/src/wasmjit/fp64.cpp")
+target_include_directories(vita3k_jit_backend_test_node PRIVATE "${VITA_ROOT}/cpu/src")
+target_link_libraries(vita3k_jit_backend_test_node PRIVATE vita3k_dynarmic_frontend vita3k_web_runtime_core)
+target_link_options(vita3k_jit_backend_test_node PRIVATE
+    ${VITA3K_WEB_GROWTH_LINK_OPTION} -sALLOW_TABLE_GROWTH=1 -Wl,--export-table
+    -sSTACK_SIZE=1048576 "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=['$setWasmTableEntry','$getWasmTableEntry']")
+
+# AOT module equivalence: interpreter oracle vs lazy JIT vs a built and
+# loaded AOT module (vita3k/cpu/src/wasmjit/AOT.md).
+add_executable(vita3k_jit_aot_module_test_node "${VITA_ROOT}/cpu/tests/wasmjit_aot_module_test.cpp"
+    "${VITA_ROOT}/cpu/src/wasmjit/emit_wasm.cpp"
+    "${VITA_ROOT}/cpu/src/wasmjit/fp64.cpp")
+target_include_directories(vita3k_jit_aot_module_test_node PRIVATE "${VITA_ROOT}/cpu/src")
+target_link_libraries(vita3k_jit_aot_module_test_node PRIVATE vita3k_dynarmic_frontend vita3k_web_runtime_core)
+target_link_options(vita3k_jit_aot_module_test_node PRIVATE
+    ${VITA3K_WEB_GROWTH_LINK_OPTION} -sALLOW_TABLE_GROWTH=1 -Wl,--export-table
+    -sSTACK_SIZE=1048576 "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=['$setWasmTableEntry','$getWasmTableEntry']")
+
+# AOT-1 experiment: same TU discipline as the backend test (includes
+# wasm_jit_cpu.cpp directly for form_region/translate_block/validate helpers),
+# plus the runtime core's InterpreterCPU for the reference comparison.
+add_executable(vita3k_jit_aot_cluster_test_node "${VITA_ROOT}/cpu/tests/wasmjit_aot_cluster_test.cpp"
+    "${VITA_ROOT}/cpu/src/wasmjit/emit_wasm.cpp"
+    "${VITA_ROOT}/cpu/src/wasmjit/fp64.cpp")
+target_include_directories(vita3k_jit_aot_cluster_test_node PRIVATE "${VITA_ROOT}/cpu/src")
+target_link_libraries(vita3k_jit_aot_cluster_test_node PRIVATE vita3k_dynarmic_frontend vita3k_web_runtime_core)
+target_link_options(vita3k_jit_aot_cluster_test_node PRIVATE
+    ${VITA3K_WEB_GROWTH_LINK_OPTION} -sALLOW_TABLE_GROWTH=1 -Wl,--export-table
+    -sSTACK_SIZE=1048576 "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=['$setWasmTableEntry','$getWasmTableEntry']")

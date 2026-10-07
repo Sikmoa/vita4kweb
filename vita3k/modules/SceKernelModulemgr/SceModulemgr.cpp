@@ -1,0 +1,238 @@
+// Vita3K emulator project
+// Copyright (C) 2026 Vita3K team
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+#include "SceModulemgr.h"
+#include <io/functions.h>
+#include <kernel/load_self.h>
+#include <kernel/state.h>
+
+#include <modules/module_parent.h>
+#include <util/lock_and_find.h>
+#include <cstdio>
+#include <cstdlib>
+
+#include <util/tracy.h>
+TRACY_MODULE_NAME(SceModulemgr);
+
+EXPORT(int, _sceKernelCloseModule) {
+    TRACY_FUNC(_sceKernelCloseModule);
+    return UNIMPLEMENTED();
+}
+
+EXPORT(SceUID, _sceKernelLoadModule, char *path, int flags, SceKernelLMOption *option) {
+    TRACY_FUNC(_sceKernelLoadModule, path, flags, option);
+    return load_module(emuenv, path, flags & SCE_KERNEL_LOAD_MODULE_SYSTEM);
+}
+
+static SceUID kernel_start_module(EmuEnvState &emuenv, SceUID module_id, SceSize args, Ptr<const void> argp, int *pRes) {
+    const SceKernelModulePtr module = lock_and_find(module_id, emuenv.kernel.loaded_modules, emuenv.kernel.mutex);
+    if (!module) {
+        const char *export_name = __FUNCTION__;
+        return RET_ERROR(SCE_KERNEL_ERROR_MODULEMGR_NO_MOD);
+    }
+    auto result = start_module(emuenv, *module, args, argp);
+    if (pRes)
+        *pRes = result;
+
+    return module->info.modid;
+}
+
+static int kernel_stop_module(EmuEnvState &emuenv, SceUID module_id, SceSize args, Ptr<const void> argp, int *pRes) {
+    const SceKernelModulePtr module = lock_and_find(module_id, emuenv.kernel.loaded_modules, emuenv.kernel.mutex);
+    if (!module) {
+        const char *export_name = __FUNCTION__;
+        return RET_ERROR(SCE_KERNEL_ERROR_MODULEMGR_NO_MOD);
+    }
+    auto result = stop_module(emuenv, *module, args, argp);
+    if (pRes)
+        *pRes = result;
+    return 0;
+}
+
+EXPORT(SceUID, _sceKernelLoadStartModule, const char *moduleFileName, SceSize args, Ptr<const void> argp, SceUInt32 flags, const SceKernelLMOption *pOpt, int *pRes) {
+    TRACY_FUNC(_sceKernelLoadStartModule, moduleFileName, args, argp, flags, pOpt, pRes);
+    // Is workaround for fix crash on loading "rgpluginsgm_psvita" module, relate issue #1095 on github, delete this after fix it.
+    if (std::string_view(moduleFileName).contains("rgpluginsgm_psvita")) {
+        LOG_WARN("Bypass load this module: {}", moduleFileName);
+        return SCE_KERNEL_ERROR_MODULEMGR_INVALID_TYPE;
+    }
+
+    const bool trace = std::getenv("VITA3K_TRACE_HLE") != nullptr;
+    if (trace) std::fprintf(stderr, "[module-trace] load path=%s\n", moduleFileName);
+    SceUID module_id = load_module(emuenv, moduleFileName, flags & SCE_KERNEL_LOAD_MODULE_SYSTEM);
+    if (trace) std::fprintf(stderr, "[module-trace] loaded uid=%d; starting\n", module_id);
+    if (module_id < 0)
+        return module_id;
+    return kernel_start_module(emuenv, module_id, args, argp, pRes);
+}
+
+EXPORT(int, _sceKernelOpenModule) {
+    TRACY_FUNC(_sceKernelOpenModule);
+    return UNIMPLEMENTED();
+}
+
+EXPORT(int, _sceKernelStartModule, SceUID uid, SceSize args, Ptr<const void> argp, SceUInt32 flags, const SceKernelStartModuleOpt *pOpt, int *pRes) {
+    TRACY_FUNC(_sceKernelStartModule, uid, args, argp, flags, pOpt, pRes);
+
+    return kernel_start_module(emuenv, uid, args, argp, pRes);
+}
+
+EXPORT(int, _sceKernelStopModule, SceUID uid, SceSize args, Ptr<const void> argp, SceUInt32 flags, const SceKernelStopModuleOpt *pOpt, int *pRes) {
+    TRACY_FUNC(_sceKernelStopModule, uid, args, argp, flags, pOpt, pRes);
+    return kernel_stop_module(emuenv, uid, args, argp, pRes);
+}
+
+EXPORT(int, _sceKernelStopUnloadModule, SceUID uid, SceSize args, Ptr<const void> argp, SceUInt32 flags, const void *pOpt, int *pRes) {
+    TRACY_FUNC(_sceKernelStopUnloadModule, uid, args, argp, flags, pOpt, pRes);
+    int ret = kernel_stop_module(emuenv, uid, args, argp, pRes);
+    if (ret < 0)
+        return ret;
+
+    return unload_module(emuenv, uid);
+}
+
+EXPORT(int, _sceKernelUnloadModule, SceUID uid, SceUInt32 flags, const void *pOpt) {
+    TRACY_FUNC(_sceKernelUnloadModule);
+    return unload_module(emuenv, uid);
+}
+
+EXPORT(int, sceKernelGetAllowedSdkVersionOnSystem) {
+    TRACY_FUNC(sceKernelGetAllowedSdkVersionOnSystem);
+    return UNIMPLEMENTED();
+}
+
+EXPORT(int, sceKernelGetLibraryInfoByNID) {
+    TRACY_FUNC(sceKernelGetLibraryInfoByNID);
+    return UNIMPLEMENTED();
+}
+
+EXPORT(int, sceKernelGetModuleIdByAddr, Ptr<void> addr) {
+    TRACY_FUNC(sceKernelGetModuleIdByAddr, addr);
+    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+
+    for (const auto &module : emuenv.kernel.loaded_modules) {
+        for (auto &segment : module.second->info.segments) {
+            const auto segment_address_begin = segment.vaddr.address();
+            const auto segment_address_end = segment_address_begin + segment.memsz;
+            if (addr.address() > segment_address_begin && addr.address() < segment_address_end) {
+                return module.first;
+            }
+        }
+    }
+
+    return RET_ERROR(SCE_KERNEL_ERROR_MODULEMGR_NOENT);
+}
+
+EXPORT(int, sceKernelGetModuleInfo, SceUID modid, SceKernelModuleInfo *info) {
+    TRACY_FUNC(sceKernelGetModuleInfo, modid, info);
+    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+
+    auto module = emuenv.kernel.loaded_modules.find(modid);
+    if (module == emuenv.kernel.loaded_modules.end()) {
+        return RET_ERROR(SCE_KERNEL_ERROR_LIBRARYDB_NO_MOD);
+    }
+
+    memcpy(info, &module->second->info, module->second->info.size);
+
+    return SCE_KERNEL_OK;
+}
+
+// The modules of the process (kernel modules loaded here for the LLE
+// sysmodule are not among them), in firmware 3.74's two classes: flag bit 0
+// selects modules loaded without SCE_KERNEL_LOAD_MODULE_SYSTEM, bit 7 the
+// system ones.
+static bool in_module_class(const KernelModule &module, int flags) {
+    if (std::string_view(module.info.path).ends_with(".skprx"))
+        return false;
+    return module.system_loaded ? (flags & 0x80) != 0 : (flags & 1) != 0;
+}
+
+// Firmware 3.74 modulemgr: flags 0 means 1; without an output array the
+// result is the number of such modules; the list stops at *num entries.
+EXPORT(int, sceKernelGetModuleList, int flags, SceUID *modids, SceUInt32 *num) {
+    TRACY_FUNC(sceKernelGetModuleList, flags, modids, num);
+    if (flags == 0)
+        flags = 1;
+    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+    // for Maidump main module should be the last module
+    std::vector<SceUID> ids;
+    SceUID main_module_id = 0;
+    for (auto &[module_id, module] : emuenv.kernel.loaded_modules) {
+        if (!in_module_class(*module, flags))
+            continue;
+        if (module->info.path == "app0:" + emuenv.self_path)
+            main_module_id = module_id;
+        else
+            ids.push_back(module_id);
+    }
+    if (main_module_id != 0)
+        ids.push_back(main_module_id);
+    if (!modids)
+        return static_cast<int>(ids.size());
+    if (!num)
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_MEMORY_ACCESS);
+    const SceUInt32 count = std::min<SceUInt32>(*num, static_cast<SceUInt32>(ids.size()));
+    std::copy_n(ids.begin(), count, modids);
+    *num = count;
+    return SCE_KERNEL_OK;
+}
+
+struct SceKernelSystemSwVersion {
+    SceSize size;
+    char versionString[0x1C];
+    SceUInt version;
+    SceUInt unk_24;
+};
+static_assert(sizeof(SceKernelSystemSwVersion) == 0x28);
+
+// Firmware 3.74 modulemgr: the installed version (read from secure storage,
+// 0x03740011 on a 3.74 console, the value of every 3.74 module's SDK version)
+// and "major.minor" from its BCD digits.
+EXPORT(int, sceKernelGetSystemSwVersion, SceKernelSystemSwVersion *version) {
+    TRACY_FUNC(sceKernelGetSystemSwVersion, version);
+    if (!version) // the copy-in faults; user callers see the fault without bit 30
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_MEMORY_ACCESS);
+    if (version->size != sizeof(SceKernelSystemSwVersion))
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    *version = {};
+    version->size = sizeof(SceKernelSystemSwVersion);
+    version->version = 0x03740011;
+    strcpy(version->versionString, "3.74");
+    return 0;
+}
+
+EXPORT(int, sceKernelInhibitLoadingModule) {
+    TRACY_FUNC(sceKernelInhibitLoadingModule);
+    return UNIMPLEMENTED();
+}
+
+// Firmware 3.74 modulemgr: whether the process module whose segments hold
+// addr was a system load (0 when no module holds it). Never an error.
+EXPORT(int, sceKernelIsCalledFromSysModule, Address addr) {
+    TRACY_FUNC(sceKernelIsCalledFromSysModule, addr);
+    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+    for (const auto &[module_id, module] : emuenv.kernel.loaded_modules) {
+        if (!in_module_class(*module, 0x81))
+            continue;
+        for (const auto &segment : module->info.segments) {
+            const Address start = segment.vaddr.address();
+            if (segment.memsz && addr >= start && addr - start < segment.memsz)
+                return module->system_loaded ? 1 : 0;
+        }
+    }
+    return 0;
+}

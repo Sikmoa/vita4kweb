@@ -18,4 +18,4 @@ cmake --build "$root/web64" --target vita3k_web_dist -j "$jobs"
 emcmake cmake -S . -B "$root/web64-mt" "${common[@]}" -DCMAKE_C_FLAGS=-pthread -DCMAKE_CXX_FLAGS=-pthread \
   -DVITA3K_WEB_DIST="$PWD/$root/web64/dist"
 cmake --build "$root/web64-mt" --target vita3k_web_dist -j "$jobs"
-browser/pages/assemble.sh "$root/web64/dist" "$site"
+bash browser/pages/assemble.sh "$root/web64/dist" "$site"

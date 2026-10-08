@@ -31,6 +31,12 @@ jobs:
         with:
           submodules: recursive
 
+      # The repo carries .gitmodules but not the submodule checkouts, so
+      # external/capstone, fmt, spdlog, sdl, boost, dynarmic ... may be empty.
+      # This clones whichever are missing (a no-op when they are present).
+      - name: Fetch third-party sources
+        run: bash browser/pages/fetch_externals.sh
+
       # The flake pins the toolchain (Emscripten, Node, CMake) the runtime is
       # developed with.
       - uses: cachix/install-nix-action@v31

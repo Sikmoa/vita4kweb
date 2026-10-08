@@ -9,36 +9,40 @@
 # directory" or "Cannot find source file". A directory that already has content
 # (a real submodule checkout, a local clone) is left untouched.
 #
-# URLs come from .gitmodules. Refs are best-effort (the exact upstream commits
-# are not recorded without real submodule entries); an empty ref means the
-# remote's default branch, and a ref that does not exist falls back to it with
-# a warning. The commit used is printed so it can be pinned.
+# URLs come from .gitmodules. The exact upstream commits are not recorded
+# without real submodule entries, so each entry is:
+#   path | candidate refs (space separated, tried in order) | probe file
+# Candidates are tags/branches; after them the remote's default branch is
+# tried. A clone only counts if the probe file exists in it, which lets an
+# entry walk back to an older release that still has the layout the sources
+# expect. The commit used is printed so it can be pinned.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-# path|ref
 needed=(
-  "external/boost|"
-  "external/capstone|5.0.3"
-  "external/dlmalloc|"
-  "external/dynarmic|"
-  "external/ffmpeg|"
-  "external/fmt|"
-  "external/LibAtrac9|"
-  "external/pugixml|"
-  "external/sdl|release-3.2.x"
-  "external/spdlog|v1.x"
-  "external/stb|"
-  "external/vita-toolchain|"
-  "external/xxHash|v0.8.3"
-  "external/yaml-cpp|"
+  "external/boost||libs/filesystem/src"
+  "external/capstone|5.0.3|include/capstone/capstone.h"
+  "external/dlmalloc||"
+  "external/dynarmic||externals/mcl"
+  "external/ffmpeg||include"
+  "external/fmt||src/format.cc"
+  "external/glslang|15.4.0 15.3.0 15.2.0 15.1.0 15.0.0 14.3.0 14.2.0 14.1.0 14.0.0 13.1.1|SPIRV/spirv.hpp"
+  "external/LibAtrac9||C/src"
+  "external/libfat16||src"
+  "external/psvpfstools||psvpfsparser"
+  "external/pugixml||src/pugixml.cpp"
+  "external/sdl|release-3.2.x|include/SDL3/SDL.h"
+  "external/spdlog|v1.x|include/spdlog/spdlog.h"
+  "external/stb||"
+  "external/vita-toolchain||src"
+  "external/xxHash|v0.8.3|xxhash.h"
+  "external/yaml-cpp||include/yaml-cpp/yaml.h"
 )
 
 have_content() { [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
 
 for entry in "${needed[@]}"; do
-  path=${entry%%|*}
-  ref=${entry#*|}
+  IFS='|' read -r path refs probe <<<"$entry"
   if have_content "$path"; then
     echo "fetch_externals: $path already present"
     continue
@@ -49,28 +53,31 @@ for entry in "${needed[@]}"; do
     exit 1
   fi
 
-  # Pinned ref twice (network hiccups), then the default branch.
-  tries=("$ref" "$ref" "")
   fetched=0
-  n=0
-  for try_ref in "${tries[@]}"; do
-    n=$((n + 1))
-    args=(--depth 1 --recurse-submodules --shallow-submodules)
-    if [ -n "$try_ref" ]; then args+=(--branch "$try_ref"); fi
-    rm -rf "$path"
-    if git clone "${args[@]}" "$url" "$path"; then
-      if [ -n "$ref" ] && [ -z "$try_ref" ]; then
-        echo "fetch_externals: WARNING ref '$ref' unavailable for $path, used default branch" >&2
+  for round in 1 2; do
+    # shellcheck disable=SC2086  # $refs is a deliberate word list
+    for try_ref in $refs ""; do
+      args=(--depth 1 --recurse-submodules --shallow-submodules)
+      if [ -n "$try_ref" ]; then args+=(--branch "$try_ref"); fi
+      rm -rf "$path"
+      if ! git clone -q "${args[@]}" "$url" "$path" 2>/dev/null; then
+        echo "fetch_externals: $path: ${try_ref:-default branch} unavailable" >&2
+        continue
+      fi
+      if [ -n "$probe" ] && [ ! -e "$path/$probe" ]; then
+        echo "fetch_externals: $path: ${try_ref:-default branch} lacks $probe, trying another" >&2
+        rm -rf "$path"
+        continue
       fi
       echo "fetch_externals: $path @ $(git -C "$path" rev-parse HEAD) (${try_ref:-default branch})"
       fetched=1
-      break
-    fi
-    echo "fetch_externals: clone of $url failed (attempt $n/3)" >&2
-    sleep $((n * 5))
+      break 2
+    done
+    echo "fetch_externals: $path: round $round failed" >&2
+    sleep 10
   done
   if [ "$fetched" -ne 1 ]; then
-    echo "fetch_externals: could not fetch $path from $url" >&2
+    echo "fetch_externals: could not fetch a usable $path from $url" >&2
     exit 1
   fi
 done

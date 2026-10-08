@@ -8,7 +8,7 @@
 #   site dir (build/pages): the site, from assemble.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-for dep in boost capstone dynarmic fmt sdl spdlog vita-toolchain; do
+for dep in boost capstone dlmalloc dynarmic fmt LibAtrac9 pugixml sdl spdlog stb vita-toolchain xxHash yaml-cpp; do
   if [ -z "$(ls -A "external/$dep" 2>/dev/null)" ]; then
     echo "external/$dep is missing or empty. Run browser/pages/fetch_externals.sh" \
       "(or git submodule update --init --recursive) first." >&2

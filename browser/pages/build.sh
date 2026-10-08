@@ -8,6 +8,13 @@
 #   site dir (build/pages): the site, from assemble.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+for dep in boost capstone dynarmic fmt sdl spdlog vita-toolchain; do
+  if [ -z "$(ls -A "external/$dep" 2>/dev/null)" ]; then
+    echo "external/$dep is missing or empty. Run browser/pages/fetch_externals.sh" \
+      "(or git submodule update --init --recursive) first." >&2
+    exit 1
+  fi
+done
 root=${1:-build/pages-build}
 site=${2:-build/pages}
 jobs=${VITA3K_BUILD_JOBS:-$(nproc)}
